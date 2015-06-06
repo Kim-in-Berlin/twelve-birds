@@ -1,0 +1,402 @@
+/*********************************** D O C U M E N T A T I O N ****************************************** 
+
+                       Kim's Klock with 12 birds in two levels on four branches
+ 
+ For details of Arduino
+ See http://www.arduino.cc/en/Main/ArduinoBoardUno
+ 
+ For details of 16-way servo driver board
+ See https://learn.adafruit.com/16-channel-pwm-servo-driver?view=all
+ 
+ For details of the real time clock
+ See https://learn.adafruit.com/ds1307-real-time-clock-breakout-board-kit?view=all
+ 
+ For details of the MP3 player
+ See https://learn.adafruit.com/adafruit-music-maker-shield-vs1053-mp3-wav-wave-ogg-vorbis-player?view=all
+ 
+     1   2   3      4   5   6     top row
+ ................................
+                 :
+   7   8   9     :    10  11  12  bottom row
+ ................................
+                 :
+ _______________________________
+ I                             I
+ I     box with servos etc.    I
+ _______________________________
+ 
+ NB Some birds are operated by servos where clockwise = up and some in the reverse direction i.e. anticlockwise =up
+
+ Arduino pin use
+ A0  pot used to set up
+ A1  -
+ A2  .
+ A3  -
+ A4  SDA for DS1307 RTC & 16 channel servo driver
+ A5  SCL for DS1307 RTC & 16 channel servo driver
+ 
+ 13  used by MusicMaker
+ 12  used by MusicMaker
+ 11  used by MusicMaker
+ 10  .
+  9  -
+  8  -
+ 
+  7  VS1053 audio chip select
+  6  VS1053 audio data/command select
+  5  
+  4  VS1053 audio card chip select
+  3  VS1053 audio data request DREQ
+  2  pushbutton input
+  1  -
+  0  -
+**************************** E n d   o f   d o c u m e n t a t i o n *************************************************/
+
+//      A r d u i o n o   L i b r a r i e s 
+
+#include "Wire.h"                    // to communicate with I2C devices http://www.arduino.cc/en/Reference/Wire 
+#include <SPI.h>                     // to communicate with SPI devices http://www.arduino.cc/en/Reference/SPI
+#include <Adafruit_VS1053.h>         // for Music Maker                 https://github.com/adafruit/Adafruit_VS1053_Library/blob/master/Adafruit_VS1053.h
+#include <SD.h>                      // to read & write SD cards        http://www.arduino.cc/en/Reference/SD
+#include <Servo.h>                   // to control servo motors         http://www.arduino.cc/en/Reference/Servo
+#include <Adafruit_PWMServoDriver.h> // to control 16-way servo driver  https://github.com/adafruit/Adafruit-PWM-Servo-Driver-Library/blob/master/Adafruit_PWMServoDriver.h
+#include "RTClib.h"                  // for DS1307 RTC                  https://learn.adafruit.com/ds1307-real-time-clock-breakout-board-kit?view=all
+
+// I2C bus addresses                                                    http://en.wikipedia.org/wiki/I²C#Design
+// The default address for the DS1307 RTC chip is 0x68 and for the PWMServoDriver is 0x40 so there is no conflict
+                                     
+// create PWM servo driver object
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(); // call like this for the PWMServoDriver to use the default address
+
+// The Music Maker CLK, MISO and MOSI connected to hardware SPI pins - 6 way connector. 
+// See http://arduino.cc/en/Reference/SPI "Connections"
+
+#define SHIELD_RESET  -1             // VS1053 reset pin (unused!)
+#define SHIELD_CS     7              // VS1053 chip select pin (output)
+#define SHIELD_DCS    6              // VS1053 Data/command select pin (output)
+#define CARDCS        4              // Card chip select pin
+#define DREQ          3              // VS1053 data request on interrupt pin to play audio in background http://arduino.cc/en/Reference/attachInterrupt
+
+#define rod_top 530                  // Pulse width to control MC-410 servos for calibration only
+#define rod_bottom 400               // for calibration only
+#define closed 420                   // use for commands
+#define halfOpen 450                 // use for commands - make sure that no neck stretch happens with this
+#define fullyOpen 500                // use for commands
+
+RTC_DS1307 rtc;                      // Instance of the real-time clock
+int val;                             // For the potentiometer value during set up
+int potpin = 0;                      // Analogue pin used to connect the set up potentiometer
+int lastHour;
+
+// create music maker object
+Adafruit_VS1053_FilePlayer musicPlayer = 
+Adafruit_VS1053_FilePlayer(SHIELD_RESET, SHIELD_CS, SHIELD_DCS, DREQ, CARDCS);
+  
+//********************************************************************
+// Do this just once
+//********************************************************************
+void setup()
+{
+// Set up serial interface for debug
+    Serial.begin(9600);
+    
+// Set up the RTC   
+  Wire.begin();                     // Set up the bus to RTC
+  rtc.begin();                      // Start the RTC
+  if (! rtc.isrunning())            // Just check it's OK
+    {
+    Serial.println ("RTC NOT running!");
+    }
+    
+//configure pin 2 as an input and enable the internal pull-up resistor so that pushing the button connects to GND and gives a good signal
+  pinMode(2, INPUT_PULLUP);
+  
+// Set up the servo chip driver software
+  pwm.begin();
+  pwm.setPWMFreq(60);               // Analogue servos run at about 60 Hz
+  
+ // Set up the Music maker  
+  if (! musicPlayer.begin())        // Just check it's OK
+    { 
+    Serial.println (F("Couldn't find VS1053, we have a problem Houston"));
+    while (1);
+    }
+  
+// Set up the SD card for the sounds
+  SD.begin(CARDCS);       
+  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT);   // DREQ int allows programme to perform other tasks as the file is playing
+                                                         // musicPlayer requires 8 chars plus ".mp3"
+  birdBallet();                                          // Celebrate turning on
+}
+
+//********************************************************************
+// Loop for ever
+//********************************************************************
+void loop () 
+{ 
+  int whichBird;
+  
+ //********************************
+ // Read the real-time clock
+ //******************************** 
+  DateTime now = rtc.now (); 
+  
+  if (now.hour () > 12)
+      {
+       whichBird = now.hour () -12; 
+      }
+   else
+      {
+      whichBird = now.hour ();
+      }
+      
+  if (now.hour () != lastHour)                         // If it's a new hour
+    {
+    oneCuckoo (whichBird);
+    lastHour = now.hour ();                            // Cuckoo just once
+    }  
+  
+ //********************************
+ // Check the button
+ //********************************  
+  int buttonPressed = !digitalRead (2);
+  
+  if (buttonPressed)                                   // If button is pushed then show the time
+    {
+    showTime(now.hour (), now.minute ());
+    }  
+  
+ //********************************
+ // Dawn chorus as background
+ //********************************  
+  if (musicPlayer.stopped())
+  {
+    playSound("dawnchor.mp3", 40);
+  }
+  
+ //********************************
+ // Set up only
+ //********************************
+ // val = analogRead(potpin);                                     // Read a value between 0 and 1023 from the potentiometer 
+ // uint16_t pulselen = map(val, 0, 1023, rod_bottom, rod_top);   // Scale it to use it with the servos 
+ // for (int i=1; i<13; i++) { moveBird(i, pulselen); }           // Move all of the servos to track the pot
+} 
+
+//***********************************************************************
+// Function to move birds and change direction of rotation for some birds
+//***********************************************************************
+int moveBird (int whichBird, uint16_t whereTo) 
+{
+  uint16_t inverted; 
+  
+  if (whereTo < closed)    { whereTo = closed;    }     // Prevent excessive, destructive movement
+  if (whereTo > fullyOpen) { whereTo = fullyOpen; }
+  inverted = rod_top + rod_bottom - whereTo -10;        // Half of the servos act in opposing direction - see mechanical details
+  
+  switch (whichBird) 
+    {
+    case 1:  pwm.setPWM ( 0, 0, whereTo);  break;       // Top row bird 1 (left) plugged into no. 0 of the 16 outputs i.e. 1st one       
+    case 2:  pwm.setPWM ( 1, 0, whereTo);  break;       // Top bird 2 plugged into no. 1 of the 16 outputs        
+    case 3:  pwm.setPWM ( 2, 0, whereTo);  break;       // Top bird 3 plugged into no. 2 of the 16 outputs        
+    case 4:  pwm.setPWM (13, 0, inverted); break;       // Top bird 4 plugged into no. 13 of the 16 outputs
+    case 5:  pwm.setPWM (14, 0, inverted); break;       // Top bird 5 plugged into no. 14 of the 16 outputs         
+    case 6:  pwm.setPWM (15, 0, inverted); break;       // Top bird 6 (right) plugged into no. 15 of the 16 outputs i.e. last one         
+    case 7:  pwm.setPWM ( 3, 0, whereTo);  break;       // Bottom row bird 7 (left) plugged into no. 3 of the 16 outputs         
+    case 8:  pwm.setPWM ( 4, 0, whereTo);  break;       // Bottom bird 8 plugged into no. 4 of the 16 outputs         
+    case 9:  pwm.setPWM ( 5, 0, whereTo);  break;       // Bottom bird 9 plugged into no. 5 of the 16 outputs         
+    case 10: pwm.setPWM (10, 0, inverted); break;       // Bottom bird 10 plugged into no. 10 of the 16 outputs         
+    case 11: pwm.setPWM (11, 0, inverted); break;       // Bottom bird 11 plugged into no. 11 of the 16 outputs         
+    case 12: pwm.setPWM (12, 0, inverted); break;       // Bottom bird 12 plugged into no. 12 of the 16 outputs
+    break; 
+    }
+}
+
+/****************************************************************/
+// Move beak to look like singing
+/****************************************************************/
+void sing (int whichBird, int howLong)                               
+{
+int chirp = halfOpen-10;
+int chirpCount;
+
+for (int i=0; i<howLong; i++)
+      {  
+      chirpCount = random (1,10);                                 // Different number of chirps for each loop
+      for (uint16_t whereTo=closed; whereTo<halfOpen; whereTo++)
+        {
+        moveBird (whichBird, whereTo);
+        delay (5);
+        }
+      for(int i=0; i<chirpCount; i++)                             // Do quick chirps
+        {  
+        moveBird (whichBird, chirp); 
+        delay (50);
+        moveBird (whichBird, halfOpen); 
+        delay (50);    
+        }  
+      for (uint16_t whereTo=halfOpen; whereTo>closed; whereTo--)
+        {
+        moveBird (whichBird, whereTo); 
+        delay (5);
+        }
+      }
+}
+
+/****************************************************************/
+// Get birds to show the time
+/****************************************************************/
+void showTime (int hours, int minutes)                               
+{
+  int fiveMinutesBird;                   // number from 1 to 12
+  int hoursShown;                    // number from 1 to 12
+    
+// ***************** H O U R S ********************************
+    if (hours>12){hoursShown = hours -12;}               // Only 12 birds, not 24
+    else {hoursShown = hours;}
+ 
+    for (int beak=closed; beak<fullyOpen; beak++)
+      {
+      for (int i=1; i<(hoursShown+1); i++) 
+        {
+           moveBird(i, beak);                           // Open as many beaks & stretch as many necks as hours
+        }
+        delay(10);                                      // Not too abruptly
+      }
+    delay(1000);                                        // Keep up long enough to count
+    for (int beak=fullyOpen; beak>closed; beak--)
+      {
+      for (int i=1; i<(hoursShown+1); i++) 
+        {
+           moveBird(i, beak);                           // Close beaks, retract necks
+        }
+        delay(10);
+      }
+      
+// ***************** M I N U T E S ********************************
+
+    fiveMinutesBird = minutes/5;                        // Only got 12 birds not 60
+    if (fiveMinutesBird ==0){fiveMinutesBird=12;}       // No birds is boring so use all 12
+    
+    for (int beak=closed; beak<halfOpen; beak++)
+      {
+      for (int i=1; i<(fiveMinutesBird+1); i++) 
+        {
+           moveBird (i, beak);                         // Open as many beaks as there are 5 minutes
+        }
+        delay(5);                                      // Not too abruptly
+      }
+    delay(200);      // wait for interfenece on power supply to stop?
+    // Sing a 5 minute song 
+
+    // Different song for each bird
+    switch (fiveMinutesBird) 
+    {
+    case 1:  playSound ("Amselams.mp3", 0); break;
+    case 2:  playSound ("Bienenfr.mp3", 0); break;
+    case 3:  playSound ("Buchfink.mp3", 0); break;
+    case 4:  playSound ("Distelfi.mp3", 0); break;
+    case 5:  playSound ("Feldlerc.mp3", 0); break;
+    case 6:  playSound ("Enteduck.mp3", 0); break;
+    case 7:  playSound ("Grunfink.mp3", 0); break;
+    case 8:  playSound ("Kohlmeis.mp3", 0); break;
+    case 9:  playSound ("Misteldr.mp3", 0); break;
+    case 10: playSound ("Ortolann.mp3", 0); break;
+    case 11: playSound ("Sumpfroh.mp3", 0); break;
+    case 12: playSound ("Nachtiga.mp3", 0); break;
+    break; 
+    }
+    sing (fiveMinutesBird, 8);                         // Make last bird sing a few times while the viewer is working out how many minutes
+
+    for (int beak=halfOpen; beak>closed; beak--)       // Close beaks
+      {
+      for (int i=1; i<(fiveMinutesBird+1); i++) 
+        {
+           moveBird(i, beak);                          
+        }
+        delay(5);
+      }
+      
+}
+
+/****************************************************************/
+// Bird ballet when switched on
+/****************************************************************/
+void birdBallet()
+  {
+    int balletDelay =10;
+    
+    // Diamond shape
+    openPair (2, 5,  closed, halfOpen,  balletDelay);
+    openPair (3, 4,  closed, fullyOpen, balletDelay);
+    openPair (7, 12, closed, fullyOpen, balletDelay);
+    openPair (8, 11, closed, halfOpen,  balletDelay);
+    
+    delay (1000);
+ 
+    closePair (2, 5,  halfOpen,  closed, balletDelay);
+    closePair (3, 4,  fullyOpen, closed, balletDelay);
+    closePair (7, 12, fullyOpen, closed, balletDelay);
+    closePair (8, 11, halfOpen,  closed, balletDelay);
+  }
+  
+/****************************************************************/
+// Open pair
+/****************************************************************/
+void openPair(int firstBird, int secondBird, int from, int to, int balletDelay)
+  {
+     for (int beak=from; beak<to; beak++)
+      {
+      moveBird (firstBird, beak);                           // Open two beaks more or less simultaneously
+      moveBird (secondBird, beak);  
+      delay    (balletDelay);
+      }
+  }
+  
+/****************************************************************/
+// Close pair
+/****************************************************************/
+void closePair(int firstBird, int secondBird, int from, int to, int balletDelay)
+  {
+     for (int beak=from; beak>to; beak--)
+      {
+      moveBird (firstBird, beak);                           // Closes two beaks more or less simultaneously
+      moveBird (secondBird, beak);  
+      delay    (balletDelay);
+      }
+  }
+
+/****************************************************************/
+// one cuckoo
+/****************************************************************/
+void oneCuckoo (int whichBird)
+  {
+     playSound ("CuckoooB.mp3", 0);           // Just one cuckoo
+ 
+  
+       for (uint16_t whereTo=closed; whereTo<halfOpen; whereTo++)
+        {
+        moveBird (whichBird, whereTo);
+        delay (5);
+        }
+ delay (1000); 
+      for (uint16_t whereTo=halfOpen; whereTo>closed; whereTo--)
+        {
+        moveBird (whichBird, whereTo); 
+        delay (5);
+        }
+}
+/****************************************************************/
+// Play sound
+/****************************************************************/
+void playSound (char* what, int howLoud)
+{
+  if (! musicPlayer.begin())        // Just check it's OK
+    { 
+    Serial.println (F("Couldn't find VS1053, we have a problem Houston"));
+    moveBird (1, halfOpen);         // Signal the problem with bird 1 
+    while (1);
+    }                                  // resets the player too, otherwise it gets confused
+    musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT);
+    musicPlayer.setVolume(howLoud, howLoud);     
+    musicPlayer.startPlayingFile(what);
+}
